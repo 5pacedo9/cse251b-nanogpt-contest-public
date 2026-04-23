@@ -108,7 +108,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50257 # GPT-2 BPE vocab size; required by the CSE 251B competition eval interface (evaluate.py expects logits over exactly 50257 tokens). Upstream nanoGPT padded this to 50304 for matmul alignment, but we train on 50257 so total params / lm_head output match the submission spec directly.
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -145,14 +145,28 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        total_params = sum(p.numel() for p in self.parameters())
+        non_embed = self.get_num_params()  # non-embedding, for Chinchilla/MFU context
+        print(f"number of parameters: total={total_params:,} ({total_params/1e6:.2f}M, competition metric), "
+              f"non-embedding={non_embed:,} ({non_embed/1e6:.2f}M)")
+        if total_params > 100_000_000:
+            print(f"*** WARNING: total params {total_params:,} > 100,000,000 competition limit. ***")
 
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
+
         For non-embedding count (default), the position embeddings get subtracted.
         The token embeddings would too, except due to the parameter sharing these
         params are actually used as weights in the final layer, so we include them.
+
+        Used by estimate_mfu() for Chinchilla-style FLOPs accounting.
+
+        NOT the competition metric. The CSE 251B NanoGPT competition caps
+        *total* params at 100M, computed as
+            sum(p.numel() for p in model.parameters())
+        which differs from this function's return value by wpe.numel()
+        (block_size * n_embd). See the total-params print at the top of __init__.
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
@@ -168,6 +182,20 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
+        """
+        Returns:
+            logits: FloatTensor of shape (B, T, vocab_size) -- full-sequence,
+                    always. This matches the CSE 251B competition eval interface
+                    (see evaluate.py). Callers that only need the last position
+                    (e.g. generate()) slice `logits[:, -1, :]` themselves.
+            loss:   scalar cross-entropy over `targets` if given, else None.
+
+        Submission note: evaluate.py expects a plain Tensor of shape
+        (B, T, 50257), not the (logits, loss) tuple this method returns, and
+        our `vocab_size` may be padded to 50304. The submission wrapper in
+        out/baseline/model.py::EvalWrapper handles both: it unpacks the tuple
+        and slices the last dim down to 50257.
+        """
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -181,13 +209,14 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
 
+        # Always compute full-sequence logits so the competition eval interface
+        # works without a special inference branch. The old "lm_head on last
+        # position only" micro-opt saved one matmul in generate() but silently
+        # broke PPL computation in evaluate.py.
+        logits = self.lm_head(x)  # (B, T, vocab_size)
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
