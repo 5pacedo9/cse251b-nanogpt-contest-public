@@ -76,7 +76,9 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
+# Resolve configurator.py relative to this script so train.py works from any cwd
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+exec(open(os.path.join(_SCRIPT_DIR, 'configurator.py')).read()) # overrides from command line or config file
 
 # Resolve schedule sentinels against the (possibly overridden) max_iters / learning_rate.
 # This binds lr_decay_iters to this run's budget and prevents the classic nanoGPT footgun
@@ -126,7 +128,11 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+# Anchor data lookup to the repo root (parent of this script's dir) so training
+# works regardless of cwd. Repo layout: repo_root/nanoGPT/train.py reads
+# repo_root/data/<dataset>/{train,val}.bin
+_REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
+data_dir = os.path.join(_REPO_ROOT, 'data', dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
