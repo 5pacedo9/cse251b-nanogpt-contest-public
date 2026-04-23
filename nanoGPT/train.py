@@ -164,9 +164,13 @@ if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
+    # CSE 251B competition requires vocab_size=50257 (GPT-2 BPE); evaluate.py
+    # expects logits over exactly 50257 tokens. Upstream nanoGPT defaulted to
+    # 50304 for matmul alignment, but we pin 50257 so training vocab matches
+    # the submission interface without needing a slice wrapper.
     if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+        print("defaulting to vocab_size = 50257 (GPT-2 BPE, competition requirement)")
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50257
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
