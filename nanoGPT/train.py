@@ -62,10 +62,12 @@ beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
+# Sentinels `-1` mean "auto-derive from max_iters / learning_rate" after configurator.py runs.
+# Pass an explicit non-negative value on CLI to override. See resolution block below.
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+warmup_iters = -1 # -1 = auto = max(int(0.05 * max_iters), 1)
+lr_decay_iters = -1 # -1 = auto = max_iters (Chinchilla-style, matches this run's budget)
+min_lr = -1.0 # -1 = auto = 0.1 * learning_rate
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -75,6 +77,18 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
+
+# Resolve schedule sentinels against the (possibly overridden) max_iters / learning_rate.
+# This binds lr_decay_iters to this run's budget and prevents the classic nanoGPT footgun
+# where a 5000-step run inherits lr_decay_iters=600000 and never actually decays.
+if lr_decay_iters is not None and lr_decay_iters < 0:
+    lr_decay_iters = max_iters
+if warmup_iters is not None and warmup_iters < 0:
+    warmup_iters = max(int(0.05 * max_iters), 1)
+if min_lr is not None and min_lr < 0:
+    min_lr = learning_rate * 0.1
+print(f"resolved schedule: warmup_iters={warmup_iters}, lr_decay_iters={lr_decay_iters}, min_lr={min_lr}, learning_rate={learning_rate}, max_iters={max_iters}")
+
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
