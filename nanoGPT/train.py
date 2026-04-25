@@ -43,6 +43,7 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_mode = 'offline' # 'online' / 'offline' / 'disabled'. Offline writes to ./wandb/, sync later.
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -268,7 +269,7 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config, mode=wandb_mode)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -351,6 +352,8 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if wandb_log:
+            wandb.log({"iter": iter_num, "train/step_loss": lossf, "lr": lr, "iter_time_ms": dt*1000, "mfu": running_mfu*100})
     iter_num += 1
     local_iter_num += 1
 
