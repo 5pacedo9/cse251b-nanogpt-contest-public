@@ -33,7 +33,7 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 1000
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -284,7 +284,9 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    # also force a final eval+save at iter_num == max_iters so it's robust to
+    # max_iters not being a multiple of eval_interval (e.g. mid-tier 5000 / 2000)
+    if (iter_num % eval_interval == 0 or iter_num == max_iters) and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
