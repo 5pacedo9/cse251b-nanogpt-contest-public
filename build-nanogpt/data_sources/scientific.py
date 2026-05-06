@@ -1,13 +1,17 @@
 """Tokenize scientific papers into uint16 npy shards.
 
-Source: armanc/scientific_papers, config 'arxiv' (HF, public, no auth).
+Source: ccdv/arxiv-summarization (HF, parquet, public, no auth).
 Each row has 'article' (full paper body) and 'abstract'. We use 'article'.
 Output: build-nanogpt/shards/scientific/sci_*.npy.
 
 Run:
     python build-nanogpt/data_sources/scientific.py --target_tokens 1_500_000_000
 
-Default 1.5B tokens covers the worst-case E16 full-tier need (15% × 10B = 1.5B).
+Default 1.5B tokens; ccdv/arxiv-summarization train split has ~215k papers
+(~1.0–1.3B tokens). For E16 short (50–150M needed) and mid (750M needed) this
+is plenty. For full-tier (1.5B) the stream may end early — the script then
+emits whatever it got and downstream availability check flags SHORT.
+
 Restart-safe (resumes at next shard index). Delete output dir to start fresh.
 """
 
@@ -27,8 +31,8 @@ from _common import (  # noqa: E402
     setup_env,
 )
 
-DATASET_ID = "armanc/scientific_papers"
-DATASET_CONFIG = "arxiv"
+DATASET_ID = "ccdv/arxiv-summarization"
+DATASET_CONFIG = None  # default config; row schema = {'article', 'abstract'}
 TEXT_FIELD = "article"
 SOURCE_TAG = "sci"
 
@@ -44,9 +48,11 @@ def run(target_tokens: int, shard_size: int) -> None:
         print(f"[sci] already have {already:,} tokens on disk (>= {target_tokens:,}); nothing to do.")
         return
 
-    print(f"[sci] streaming {DATASET_ID} ({DATASET_CONFIG}), field='{TEXT_FIELD}'")
-    ds = load_dataset(DATASET_ID, DATASET_CONFIG, split="train", streaming=True,
-                      trust_remote_code=True)
+    print(f"[sci] streaming {DATASET_ID} (config={DATASET_CONFIG}), field='{TEXT_FIELD}'")
+    kwargs = dict(path=DATASET_ID, split="train", streaming=True)
+    if DATASET_CONFIG is not None:
+        kwargs["name"] = DATASET_CONFIG
+    ds = load_dataset(**kwargs)
 
     writer = ShardWriter(out_dir, source=SOURCE_TAG, shard_size=shard_size)
     remaining = target_tokens - already

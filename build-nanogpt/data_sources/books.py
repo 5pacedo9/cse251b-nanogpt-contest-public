@@ -1,13 +1,15 @@
-"""Tokenize books (Project Gutenberg, pre-1919) into uint16 npy shards.
+"""Tokenize books (Project Gutenberg English) into uint16 npy shards.
 
-Source: deepmind/pg19 (HF, public domain, no auth, ~28k books, ~3B tokens).
-Each row has 'text' (full book). Output: build-nanogpt/shards/books/books_*.npy.
+Source: sedthh/gutenberg_english (HF, parquet, public domain, no auth).
+Each row has 'TEXT' (full book), 'SOURCE', 'METADATA'. We use 'TEXT'.
+Output: build-nanogpt/shards/books/books_*.npy.
 
 Run:
     python build-nanogpt/data_sources/books.py --target_tokens 1_500_000_000
 
 Default 1.5B tokens covers the worst-case E16 full-tier need (15% × 10B = 1.5B).
-PG-19 has ~3B tokens total so 1.5B is well within the corpus.
+sedthh/gutenberg_english is sized in the multi-billion-token range so 1.5B
+is well within the corpus.
 """
 
 from __future__ import annotations
@@ -26,8 +28,8 @@ from _common import (  # noqa: E402
     setup_env,
 )
 
-DATASET_ID = "deepmind/pg19"
-TEXT_FIELD = "text"
+DATASET_ID = "sedthh/gutenberg_english"
+TEXT_FIELD = "TEXT"
 SOURCE_TAG = "books"
 
 
@@ -42,8 +44,8 @@ def run(target_tokens: int, shard_size: int) -> None:
         print(f"[books] already have {already:,} tokens on disk (>= {target_tokens:,}); nothing to do.")
         return
 
-    print(f"[books] streaming {DATASET_ID}")
-    ds = load_dataset(DATASET_ID, split="train", streaming=True, trust_remote_code=True)
+    print(f"[books] streaming {DATASET_ID}, field='{TEXT_FIELD}'")
+    ds = load_dataset(DATASET_ID, split="train", streaming=True)
 
     writer = ShardWriter(out_dir, source=SOURCE_TAG, shard_size=shard_size)
     remaining = target_tokens - already
