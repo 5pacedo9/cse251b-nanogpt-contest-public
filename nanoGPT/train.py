@@ -134,13 +134,18 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # repo_root/data/<dataset>/{train,val}.bin
 _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
 data_dir = os.path.join(_REPO_ROOT, 'data', dataset)
+# Cache memmaps. On Windows, recreating np.memmap every batch leaks page-file
+# commit and eventually fails with [WinError 1455] (seen in exp_030 at iter ~7000
+# on a 20GB train.bin). On Linux the kernel handles cleanup so caching is safe.
+_memmap_cache = {}
+def _open_memmap(split):
+    if split not in _memmap_cache:
+        path = os.path.join(data_dir, f'{split}.bin')
+        _memmap_cache[split] = np.memmap(path, dtype=np.uint16, mode='r')
+    return _memmap_cache[split]
+
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    data = _open_memmap(split)
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
