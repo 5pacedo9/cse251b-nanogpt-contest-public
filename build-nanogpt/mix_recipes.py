@@ -29,6 +29,7 @@ TIER_TOKENS = {
 # Where each source's tokenized .npy shards live.
 SOURCE_DIRS = {
     "fineweb": REPO_ROOT / "build-nanogpt" / "edu_fineweb10B",
+    "fwf":     REPO_ROOT / "build-nanogpt" / "shards" / "fineweb_filtered",  # E20 filtered FW
     "wiki":    REPO_ROOT / "build-nanogpt" / "shards" / "wikipedia",
     "sci":     REPO_ROOT / "build-nanogpt" / "shards" / "scientific",
     "books":   REPO_ROOT / "build-nanogpt" / "shards" / "books",
@@ -37,6 +38,7 @@ SOURCE_DIRS = {
 # Glob pattern for each source's TRAIN shards (excludes any val shard).
 SOURCE_TRAIN_GLOB = {
     "fineweb": "edufineweb_train_*.npy",
+    "fwf":     "fwf_*.npy",
     "wiki":    "wiki_*.npy",
     "sci":     "sci_*.npy",
     "books":   "books_*.npy",
@@ -71,6 +73,10 @@ SHORT_MIXES = {
                                               {"fineweb": 0.80, "wiki": 0.10, "sci": 0.05, "books": 0.05}),
     "mix10_fw50_wiki20_sci15_books15": _short("mix10_fw50_wiki20_sci15_books15",
                                               {"fineweb": 0.50, "wiki": 0.20, "sci": 0.15, "books": 0.15}),
+    # E20 — filtered FineWeb-Edu (int_score>=4 + length>=100 + exact dedup).
+    "mix10_fwf100":                    _short("mix10_fwf100", {"fwf": 1.00}),
+    "mix10_fwf80_wiki10_sci5_books5":  _short("mix10_fwf80_wiki10_sci5_books5",
+                                              {"fwf": 0.80, "wiki": 0.10, "sci": 0.05, "books": 0.05}),
 }
 
 
