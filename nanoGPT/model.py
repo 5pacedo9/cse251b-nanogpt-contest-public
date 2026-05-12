@@ -114,6 +114,12 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    # E22 MTP: auxiliary heads predicting tokens at additional offsets (e.g. +2, +3).
+    # Each head is a small Linear(n_embd, n_embd) projection followed by the tied
+    # lm_head, so each adds ~n_embd**2 params (e.g. 640**2 = 409K for E10 arch).
+    # mtp_offsets is parsed from a CSV string in train.py and stored here as a tuple.
+    mtp_offsets: tuple = ()
+    mtp_lambda: float = 0.0
 
 class GPT(nn.Module):
 
@@ -136,6 +142,15 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # E22 MTP auxiliary heads: one Linear projection per extra offset; final logits
+        # use the tied lm_head so we don't add another vocab-size matrix per head.
+        # Only built when config.mtp_offsets is non-empty (training-only feature).
+        if config.mtp_offsets:
+            self.mtp_heads = nn.ModuleList([
+                nn.Linear(config.n_embd, config.n_embd, bias=False)
+                for _ in config.mtp_offsets
+            ])
 
         # init all weights
         self.apply(self._init_weights)
@@ -216,6 +231,24 @@ class GPT(nn.Module):
         logits = self.lm_head(x)  # (B, T, vocab_size)
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # E22 MTP auxiliary loss: each head predicts tokens at a further offset.
+            # targets[t] is already idx[t+1], so for offset k we pair h_t with targets[t+k-1].
+            # Training-only — at eval time `targets is None` so this branch is skipped.
+            if self.training and self.config.mtp_offsets and self.config.mtp_lambda > 0.0:
+                aux = 0.0
+                for k, proj in zip(self.config.mtp_offsets, self.mtp_heads):
+                    if k < 2:
+                        continue  # k=1 is the main head; skip
+                    shift = k - 1
+                    h_aux = proj(x)
+                    logits_aux = self.lm_head(h_aux)[:, :-shift, :]
+                    targets_aux = targets[:, shift:]
+                    aux = aux + F.cross_entropy(
+                        logits_aux.reshape(-1, logits_aux.size(-1)),
+                        targets_aux.reshape(-1),
+                        ignore_index=-1,
+                    )
+                loss = loss + self.config.mtp_lambda * aux
         else:
             loss = None
 

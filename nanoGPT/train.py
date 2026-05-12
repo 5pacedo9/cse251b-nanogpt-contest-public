@@ -67,6 +67,10 @@ eps = 1e-8                  # AdamW eps (E21b: try 1e-9)
 embed_no_wd = False         # E21c: if True, wte/wpe/lm_head get wd=0
 wd_schedule = False         # E21d: if True, cosine wd from `weight_decay` down to `min_wd`
 min_wd = 0.05               # E21d: end-of-training wd target (cosine bottoms here)
+# E22 MTP knobs. mtp_offsets is a CSV string of integer offsets (e.g. "2,3"); empty disables MTP.
+# mtp_lambda scales the summed auxiliary CE loss before adding to the main loss.
+mtp_offsets = ""
+mtp_lambda = 0.0
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -101,6 +105,14 @@ if warmup_iters is not None and warmup_iters < 0:
 if min_lr is not None and min_lr < 0:
     min_lr = learning_rate * 0.1
 print(f"resolved schedule: warmup_iters={warmup_iters}, lr_decay_iters={lr_decay_iters}, min_lr={min_lr}, learning_rate={learning_rate}, max_iters={max_iters}")
+
+# E22 MTP: parse the dash-separated offsets string into a tuple of ints.
+# Dash (not comma) because configurator.py's `literal_eval` would parse "2,3"
+# as a tuple and fail the type check against the string default; "2-3" raises
+# ValueError in literal_eval and is kept as a string so CLI override works.
+mtp_offsets_parsed = tuple(int(x) for x in mtp_offsets.split("-") if x.strip()) if mtp_offsets else ()
+if mtp_offsets_parsed:
+    print(f"MTP enabled: offsets={mtp_offsets_parsed}, lambda={mtp_lambda}")
 
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
@@ -181,7 +193,8 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,
+                  mtp_offsets=mtp_offsets_parsed, mtp_lambda=mtp_lambda) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
