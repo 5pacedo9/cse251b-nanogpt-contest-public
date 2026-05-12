@@ -57,6 +57,11 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
+# E17 optimizer trial: 'adamw' (default) / 'ademamix' / 'muon' / 'sophia'
+optimizer_name = 'adamw'
+muon_lr = 0.02              # Muon group LR (only when optimizer_name=='muon')
+sophia_rho = 0.04           # Sophia clipping threshold
+sophia_hessian_freq = 10    # Sophia GNB Hessian update every k steps; 0 disables (degenerate)
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -225,10 +230,37 @@ model.to(device)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+# optimizer (E17 trial: switchable via --optimizer_name)
+if optimizer_name == 'adamw':
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+elif optimizer_name == 'ademamix':
+    sys.path.insert(0, _SCRIPT_DIR)
+    from optim_ademamix import build_ademamix_optimizer
+    optimizer = build_ademamix_optimizer(model, lr=learning_rate, weight_decay=weight_decay,
+                                         betas=(beta1, beta2), device_type=device_type)
+elif optimizer_name == 'muon':
+    sys.path.insert(0, _SCRIPT_DIR)
+    from optim_muon import build_muon_optimizer
+    optimizer = build_muon_optimizer(model, muon_lr=muon_lr, adamw_lr=learning_rate,
+                                     weight_decay=weight_decay, betas=(beta1, beta2),
+                                     device_type=device_type)
+elif optimizer_name == 'sophia':
+    sys.path.insert(0, _SCRIPT_DIR)
+    from optim_sophia import build_sophia_optimizer
+    optimizer = build_sophia_optimizer(model, lr=learning_rate, weight_decay=weight_decay,
+                                       betas=(beta1, beta2), device_type=device_type,
+                                       rho=sophia_rho)
+else:
+    raise ValueError(f"unknown optimizer_name: {optimizer_name!r} "
+                     f"(expected 'adamw' / 'ademamix' / 'muon' / 'sophia')")
+print(f"using optimizer: {optimizer_name}")
 if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    ckpt_opt_name = checkpoint.get('optimizer_name', 'adamw')
+    if ckpt_opt_name != optimizer_name:
+        print(f"WARNING: ckpt optimizer={ckpt_opt_name}, current={optimizer_name}; "
+              f"skipping optimizer state load")
+    else:
+        optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
 # compile the model
@@ -286,8 +318,12 @@ while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
+    # Per-group cosine: each group keeps its own `initial_lr` (e.g. Muon group at 0.02,
+    # AdamW group at learning_rate). All groups scale by the same cosine fraction.
+    lr_scale = lr / learning_rate if learning_rate else 1.0
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        base = param_group.get('initial_lr', learning_rate)
+        param_group['lr'] = base * lr_scale
 
     # evaluate the loss on train/val sets and write checkpoints
     # also force a final eval+save at iter_num == max_iters so it's robust to
@@ -309,6 +345,7 @@ while True:
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'optimizer_name': optimizer_name,
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
@@ -344,6 +381,24 @@ while True:
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+
+    # Sophia GNB Hessian update every k iterations (separate fwd+bwd pass with sampled labels).
+    # Skipped if optimizer_name != 'sophia' or sophia_hessian_freq <= 0.
+    # Uses only the first batch element to bound memory: logits is (1, T, V) ~100MB bf16
+    # vs (B, T, V) ~1.2GB. GNB is a stochastic estimator; smaller batch is just noisier.
+    if optimizer_name == 'sophia' and sophia_hessian_freq > 0 \
+            and (iter_num + 1) % sophia_hessian_freq == 0:
+        X_h = X[:1]
+        with ctx:
+            logits, _ = model(X_h, None)
+            with torch.no_grad():
+                sampled = torch.distributions.Categorical(logits=logits.detach()).sample()
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            sampled_log_p = log_probs.gather(-1, sampled.unsqueeze(-1)).squeeze(-1).sum()
+            sampled_log_p = sampled_log_p / (X_h.size(0) * X_h.size(1))
+        scaler.scale(sampled_log_p).backward()
+        optimizer.update_hessian(bs=X_h.size(0) * X_h.size(1))
+        optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
