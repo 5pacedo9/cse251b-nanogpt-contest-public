@@ -62,6 +62,11 @@ optimizer_name = 'adamw'
 muon_lr = 0.02              # Muon group LR (only when optimizer_name=='muon')
 sophia_rho = 0.04           # Sophia clipping threshold
 sophia_hessian_freq = 10    # Sophia GNB Hessian update every k steps; 0 disables (degenerate)
+# E21 AdamW micro-tune knobs (only applied when optimizer_name=='adamw')
+eps = 1e-8                  # AdamW eps (E21b: try 1e-9)
+embed_no_wd = False         # E21c: if True, wte/wpe/lm_head get wd=0
+wd_schedule = False         # E21d: if True, cosine wd from `weight_decay` down to `min_wd`
+min_wd = 0.05               # E21d: end-of-training wd target (cosine bottoms here)
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -232,7 +237,8 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer (E17 trial: switchable via --optimizer_name)
 if optimizer_name == 'adamw':
-    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type,
+                                           eps=eps, embed_no_wd=embed_no_wd)
 elif optimizer_name == 'ademamix':
     sys.path.insert(0, _SCRIPT_DIR)
     from optim_ademamix import build_ademamix_optimizer
@@ -303,6 +309,16 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+# E21d: cosine schedule for weight decay (only used when wd_schedule=True)
+def get_wd(it):
+    if it < warmup_iters:
+        return weight_decay  # hold start wd through warmup
+    if it > lr_decay_iters:
+        return min_wd
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_wd + coeff * (weight_decay - min_wd)
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -324,6 +340,16 @@ while True:
     for param_group in optimizer.param_groups:
         base = param_group.get('initial_lr', learning_rate)
         param_group['lr'] = base * lr_scale
+
+    # E21d: weight decay cosine schedule (only when wd_schedule=True).
+    # Only updates groups that started with non-zero weight_decay; nodecay groups stay at 0.
+    if wd_schedule:
+        cur_wd = get_wd(iter_num)
+        for param_group in optimizer.param_groups:
+            if 'initial_wd' not in param_group:
+                param_group['initial_wd'] = param_group['weight_decay']
+            if param_group['initial_wd'] > 0:
+                param_group['weight_decay'] = cur_wd
 
     # evaluate the loss on train/val sets and write checkpoints
     # also force a final eval+save at iter_num == max_iters so it's robust to

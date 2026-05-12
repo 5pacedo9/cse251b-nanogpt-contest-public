@@ -289,29 +289,51 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type,
+                             eps=1e-8, embed_no_wd=False):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # E21c: when embed_no_wd=True, additionally pull embeddings (wte/wpe) and lm_head out
+        # of the decay group into a no-decay group.
+        if embed_no_wd:
+            embed_keys = ('wte', 'wpe', 'lm_head')
+            decay_params      = [p for n, p in param_dict.items()
+                                 if p.dim() >= 2 and not any(k in n for k in embed_keys)]
+            embed_nodecay     = [p for n, p in param_dict.items()
+                                 if p.dim() >= 2 and any(k in n for k in embed_keys)]
+            nodecay_params    = [p for n, p in param_dict.items() if p.dim() < 2]
+            optim_groups = [
+                {'params': decay_params,   'weight_decay': weight_decay},
+                {'params': embed_nodecay,  'weight_decay': 0.0},
+                {'params': nodecay_params, 'weight_decay': 0.0},
+            ]
+            print(f"[embed_no_wd] decay (matmul) tensors: {len(decay_params)}, "
+                  f"{sum(p.numel() for p in decay_params):,} params")
+            print(f"[embed_no_wd] embed/lm_head no-decay tensors: {len(embed_nodecay)}, "
+                  f"{sum(p.numel() for p in embed_nodecay):,} params")
+            print(f"[embed_no_wd] 1D no-decay tensors: {len(nodecay_params)}, "
+                  f"{sum(p.numel() for p in nodecay_params):,} params")
+        else:
+            decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+            nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+            optim_groups = [
+                {'params': decay_params, 'weight_decay': weight_decay},
+                {'params': nodecay_params, 'weight_decay': 0.0}
+            ]
+            num_decay_params = sum(p.numel() for p in decay_params)
+            num_nodecay_params = sum(p.numel() for p in nodecay_params)
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, eps=eps, **extra_args)
+        print(f"using fused AdamW: {use_fused}, eps={eps}")
 
         return optimizer
 
