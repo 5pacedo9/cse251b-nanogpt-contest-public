@@ -26,6 +26,44 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
+# E23a RoPE helpers (HuggingFace "rotate-half" formulation).
+# cos/sin tables are precomputed once per model and registered as non-persistent
+# buffers so they regenerate on init and don't bloat checkpoints.
+
+def precompute_rope_freqs(head_dim, max_seq_len, base=10000.0):
+    """Build (max_seq_len, head_dim) cos/sin tables.
+
+    Frequencies follow the original RoPE paper:
+        theta_i = base ** (-2i / head_dim) for i in [0, head_dim/2)
+    The half-rotation HF layout duplicates each freq across the two halves of
+    the head dim so that `apply_rope` can use a plain `rotate_half` swap.
+    """
+    assert head_dim % 2 == 0, f"RoPE requires even head_dim, got {head_dim}"
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    t = torch.arange(max_seq_len).float()
+    freqs = torch.outer(t, inv_freq)  # (max_seq_len, head_dim/2)
+    emb = torch.cat((freqs, freqs), dim=-1)  # (max_seq_len, head_dim) — HF layout
+    return emb.cos(), emb.sin()
+
+
+def _rotate_half(x):
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def apply_rope(q, k, cos, sin):
+    """Apply rotary embedding to q, k of shape (B, n_head, T, head_dim).
+
+    cos, sin: (T, head_dim) sliced for this run's sequence length.
+    Returns (q_embed, k_embed) same shape as input.
+    """
+    cos = cos[None, None, :, :]  # (1, 1, T, head_dim)
+    sin = sin[None, None, :, :]
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -49,7 +87,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, rope_cos=None, rope_sin=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -57,6 +95,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # E23a RoPE: rotate q/k in-place before attention; values are not rotated.
+        # cos/sin sliced for this sequence by the caller (GPT.forward).
+        if rope_cos is not None:
+            q, k = apply_rope(q, k, rope_cos, rope_sin)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -100,8 +143,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, rope_cos=None, rope_sin=None):
+        x = x + self.attn(self.ln_1(x), rope_cos=rope_cos, rope_sin=rope_sin)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -120,6 +163,11 @@ class GPTConfig:
     # mtp_offsets is parsed from a CSV string in train.py and stored here as a tuple.
     mtp_offsets: tuple = ()
     mtp_lambda: float = 0.0
+    # E23a RoPE: when True, drop absolute position embedding (wpe) and apply
+    # rotary positional embedding to q/k inside attention. Saves ~block_size*n_embd
+    # params (e.g. 1024*640 = 655K for E10 arch) and lets the model generalize to
+    # longer contexts in principle, though we still cap at block_size for our eval.
+    use_rope: bool = False
 
 class GPT(nn.Module):
 
@@ -129,14 +177,27 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
+        # E23a: when use_rope=True, the absolute position embedding (wpe) is
+        # replaced by rotary embedding inside attention, so we don't build wpe at all
+        # (saves ~block_size*n_embd params, no wpe key in state_dict).
+        transformer_modules = dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        )
+        if not config.use_rope:
+            transformer_modules['wpe'] = nn.Embedding(config.block_size, config.n_embd)
+        self.transformer = nn.ModuleDict(transformer_modules)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # RoPE cos/sin tables: precomputed once, non-persistent so they don't
+        # bloat checkpoints and regenerate on init (no version/migration concerns).
+        if config.use_rope:
+            head_dim = config.n_embd // config.n_head
+            rope_cos, rope_sin = precompute_rope_freqs(head_dim, config.block_size)
+            self.register_buffer('rope_cos', rope_cos, persistent=False)
+            self.register_buffer('rope_sin', rope_sin, persistent=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -184,7 +245,9 @@ class GPT(nn.Module):
         (block_size * n_embd). See the total-params print at the top of __init__.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and not self.config.use_rope:
+            # RoPE has no wpe to subtract; the helper just returns total minus
+            # absolute pos-emb when present.
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -214,14 +277,22 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        if self.config.use_rope:
+            # No absolute pos embedding; rotary is applied inside attention.
+            x = self.transformer.drop(tok_emb)
+            rope_cos = self.rope_cos[:t]
+            rope_sin = self.rope_sin[:t]
+            for block in self.transformer.h:
+                x = block(x, rope_cos=rope_cos, rope_sin=rope_sin)
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
+            for block in self.transformer.h:
+                x = block(x)
         x = self.transformer.ln_f(x)
 
         # Always compute full-sequence logits so the competition eval interface
@@ -260,7 +331,12 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if not self.config.use_rope:
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        else:
+            # RoPE cos/sin tables: just slice the precomputed buffers.
+            self.rope_cos = self.rope_cos[:block_size]
+            self.rope_sin = self.rope_sin[:block_size]
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]

@@ -71,6 +71,8 @@ min_wd = 0.05               # E21d: end-of-training wd target (cosine bottoms he
 # mtp_lambda scales the summed auxiliary CE loss before adding to the main loss.
 mtp_offsets = ""
 mtp_lambda = 0.0
+# E23a RoPE: when True, drop wpe and apply rotary positional embedding to q/k.
+use_rope = False
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
@@ -194,7 +196,8 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
-                  mtp_offsets=mtp_offsets_parsed, mtp_lambda=mtp_lambda) # start with model_args from command line
+                  mtp_offsets=mtp_offsets_parsed, mtp_lambda=mtp_lambda,
+                  use_rope=use_rope) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
