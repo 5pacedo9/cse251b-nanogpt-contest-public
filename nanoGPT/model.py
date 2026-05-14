@@ -134,6 +134,30 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+
+# E23b SwiGLU MLP (LLaMA-style). Three linears: w_gate, w_up, c_proj. Activation
+# is SiLU on the gate branch, gated against the up branch. Down-proj named c_proj
+# so it inherits the existing residual scaled-init logic.
+# For ~param parity with GELU 4·d MLP, set ffn_hidden_dim ≈ (8/3)·n_embd rounded
+# to a multiple of 64 (LLaMA convention).
+class SwiGLUMLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        d_ff = config.ffn_hidden_dim
+        if d_ff <= 0:
+            d_ff = ((int((8 / 3) * config.n_embd) + 63) // 64) * 64
+        self.w_gate  = nn.Linear(config.n_embd, d_ff, bias=config.bias)
+        self.w_up    = nn.Linear(config.n_embd, d_ff, bias=config.bias)
+        self.c_proj  = nn.Linear(d_ff, config.n_embd, bias=config.bias)
+        self.silu    = nn.SiLU()
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_proj(self.silu(self.w_gate(x)) * self.w_up(x))
+        x = self.dropout(x)
+        return x
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -141,7 +165,7 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = SwiGLUMLP(config) if config.use_swiglu else MLP(config)
 
     def forward(self, x, rope_cos=None, rope_sin=None):
         x = x + self.attn(self.ln_1(x), rope_cos=rope_cos, rope_sin=rope_sin)
@@ -168,6 +192,11 @@ class GPTConfig:
     # params (e.g. 1024*640 = 655K for E10 arch) and lets the model generalize to
     # longer contexts in principle, though we still cap at block_size for our eval.
     use_rope: bool = False
+    # E23b SwiGLU: replace GELU MLP (c_fc + c_proj, hidden=4·n_embd) with SwiGLU
+    # (w_gate + w_up + c_proj). For param parity, leave ffn_hidden_dim=0 → auto
+    # picks ⌈(8/3)·n_embd⌉ rounded to 64 (LLaMA convention). Non-zero overrides.
+    use_swiglu: bool = False
+    ffn_hidden_dim: int = 0
 
 class GPT(nn.Module):
 
